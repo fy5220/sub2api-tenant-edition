@@ -10,7 +10,9 @@
 
 services:
   sub2api:
-    image: weishaw/sub2api:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
     restart: unless-stopped
     ulimits:
       nofile:
