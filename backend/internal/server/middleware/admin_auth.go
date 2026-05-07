@@ -61,7 +61,7 @@ func adminAuth(
 			if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
 				token := strings.TrimSpace(parts[1])
 				if token == "" {
-					AbortWithError(c, 401, "UNAUTHORIZED", "Authorization required")
+					abortAdminAuthError(c, 401, "UNAUTHORIZED", "Authorization required", "auth_failed")
 					return
 				}
 				if !validateJWTForAdmin(c, token, authService, userService) {
@@ -73,7 +73,7 @@ func adminAuth(
 		}
 
 		// 无有效认证信息
-		AbortWithError(c, 401, "UNAUTHORIZED", "Authorization required")
+		abortAdminAuthError(c, 401, "UNAUTHORIZED", "Authorization required", "auth_failed")
 	}
 }
 
@@ -124,20 +124,20 @@ func validateAdminAPIKey(
 ) bool {
 	storedKey, err := settingService.GetAdminAPIKey(c.Request.Context())
 	if err != nil {
-		AbortWithError(c, 500, "INTERNAL_ERROR", "Internal server error")
+		abortAdminAuthError(c, 500, "INTERNAL_ERROR", "Internal server error", "internal_error")
 		return false
 	}
 
 	// 未配置或不匹配，统一返回相同错误（避免信息泄露）
 	if storedKey == "" || subtle.ConstantTimeCompare([]byte(key), []byte(storedKey)) != 1 {
-		AbortWithError(c, 401, "INVALID_ADMIN_KEY", "Invalid admin API key")
+		abortAdminAuthError(c, 401, "INVALID_ADMIN_KEY", "Invalid admin API key", "auth_failed")
 		return false
 	}
 
 	// 获取真实的管理员用户
 	admin, err := userService.GetFirstAdmin(c.Request.Context())
 	if err != nil {
-		AbortWithError(c, 500, "INTERNAL_ERROR", "No admin user found")
+		abortAdminAuthError(c, 500, "INTERNAL_ERROR", "No admin user found", "internal_error")
 		return false
 	}
 
@@ -161,35 +161,39 @@ func validateJWTForAdmin(
 	claims, err := authService.ValidateToken(token)
 	if err != nil {
 		if errors.Is(err, service.ErrTokenExpired) {
-			AbortWithError(c, 401, "TOKEN_EXPIRED", "Token has expired")
+			abortAdminAuthError(c, 401, "TOKEN_EXPIRED", "Token has expired", "auth_failed")
 			return false
 		}
-		AbortWithError(c, 401, "INVALID_TOKEN", "Invalid token")
+		abortAdminAuthError(c, 401, "INVALID_TOKEN", "Invalid token", "auth_failed")
 		return false
 	}
 
 	// 从数据库获取用户
 	user, err := userService.GetByID(c.Request.Context(), claims.UserID)
 	if err != nil {
-		AbortWithError(c, 401, "USER_NOT_FOUND", "User not found")
+		if errors.Is(err, service.ErrUserNotFound) {
+			abortAdminAuthError(c, 401, "USER_NOT_FOUND", "User not found", "auth_failed")
+			return false
+		}
+		abortAdminAuthError(c, 500, "INTERNAL_ERROR", "Internal server error", "internal_error")
 		return false
 	}
 
 	// 检查用户状态
 	if !user.IsActive() {
-		AbortWithError(c, 401, "USER_INACTIVE", "User account is not active")
+		abortAdminAuthError(c, 401, "USER_INACTIVE", "User account is not active", "auth_failed")
 		return false
 	}
 
 	// 校验 TokenVersion，确保管理员改密后旧 token 失效
 	if claims.TokenVersion != user.TokenVersion {
-		AbortWithError(c, 401, "TOKEN_REVOKED", "Token has been revoked (password changed)")
+		abortAdminAuthError(c, 401, "TOKEN_REVOKED", "Token has been revoked (password changed)", "auth_failed")
 		return false
 	}
 
 	// 检查管理员权限
 	if !user.IsAdmin() {
-		AbortWithError(c, 403, "FORBIDDEN", "Admin access required")
+		abortAdminAuthError(c, 403, "FORBIDDEN", "Admin access required", "permission_denied")
 		return false
 	}
 

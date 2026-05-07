@@ -299,6 +299,28 @@ func (r *apiKeyRepository) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
+func (r *apiKeyRepository) HasDeleteEvidence(ctx context.Context, id int64) (bool, error) {
+	return r.client.APIKey.Query().
+		Where(apikey.IDEQ(id), apikey.DeletedAtNotNil()).
+		Exist(mixins.SkipSoftDelete(ctx))
+}
+
+func (r *apiKeyRepository) GetDeletedAt(ctx context.Context, id int64) (time.Time, error) {
+	key, err := r.client.APIKey.Query().
+		Where(apikey.IDEQ(id), apikey.DeletedAtNotNil()).
+		Only(mixins.SkipSoftDelete(ctx))
+	if err != nil {
+		if dbent.IsNotFound(err) {
+			return time.Time{}, service.ErrAPIKeyNotFound
+		}
+		return time.Time{}, err
+	}
+	if key.DeletedAt == nil {
+		return time.Time{}, service.ErrAPIKeyNotFound
+	}
+	return key.DeletedAt.UTC(), nil
+}
+
 func (r *apiKeyRepository) ListByUserID(ctx context.Context, userID int64, params pagination.PaginationParams, filters service.APIKeyListFilters) ([]service.APIKey, *pagination.PaginationResult, error) {
 	q := r.activeQuery().Where(apikey.UserIDEQ(userID))
 

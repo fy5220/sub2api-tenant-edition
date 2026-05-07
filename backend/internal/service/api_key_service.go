@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +38,8 @@ var (
 	ErrAPIKeyRateLimit5hExceeded = infraerrors.TooManyRequests("API_KEY_RATE_5H_EXCEEDED", "api key 5小时限额已用完")
 	ErrAPIKeyRateLimit1dExceeded = infraerrors.TooManyRequests("API_KEY_RATE_1D_EXCEEDED", "api key 日限额已用完")
 	ErrAPIKeyRateLimit7dExceeded = infraerrors.TooManyRequests("API_KEY_RATE_7D_EXCEEDED", "api key 7天限额已用完")
+	ErrAdminAPIKeyDeleted        = infraerrors.Conflict("API_KEY_ALREADY_DELETED", "api key has been deleted")
+	ErrAdminAPIKeyStatusInvalid  = infraerrors.New(http.StatusUnprocessableEntity, "INVALID_API_KEY_STATUS", "status must be active or inactive")
 )
 
 const (
@@ -87,6 +91,10 @@ type APIKeyRateLimitData struct {
 	Window5hStart *time.Time
 	Window1dStart *time.Time
 	Window7dStart *time.Time
+}
+
+type AdminDeleteAPIKeyResult struct {
+	DeletedAt time.Time
 }
 
 // EffectiveUsage5h returns the 5h window usage, or 0 if the window has expired.
@@ -206,6 +214,14 @@ type APIKeyService struct {
 	authGroup             singleflight.Group
 	lastUsedTouchL1       sync.Map // keyID -> nextAllowedAt(time.Time)
 	lastUsedTouchSF       singleflight.Group
+}
+
+type apiKeyDeleteEvidenceReader interface {
+	HasDeleteEvidence(ctx context.Context, id int64) (bool, error)
+}
+
+type apiKeyDeleteTombstoneReader interface {
+	GetDeletedAt(ctx context.Context, id int64) (time.Time, error)
 }
 
 // NewAPIKeyService 创建API Key服务实例
@@ -636,6 +652,59 @@ func (s *APIKeyService) Update(ctx context.Context, id int64, userID int64, req 
 	return apiKey, nil
 }
 
+func normalizeAdminAPIKeyStatus(status string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case StatusActive:
+		return StatusActive, nil
+	case "inactive":
+		return StatusDisabled, nil
+	default:
+		return "", ErrAdminAPIKeyStatusInvalid
+	}
+}
+
+// AdminCreate creates an API key for the target user using the same generic service rules as user-side creation.
+func (s *APIKeyService) AdminCreate(ctx context.Context, userID int64, req CreateAPIKeyRequest) (*APIKey, error) {
+	return s.Create(ctx, userID, req)
+}
+
+// AdminUpdateStatus updates an API key status using the external admin contract values.
+func (s *APIKeyService) AdminUpdateStatus(ctx context.Context, keyID int64, status string) (*APIKey, error) {
+	mappedStatus, err := normalizeAdminAPIKeyStatus(status)
+	if err != nil {
+		return nil, err
+	}
+
+	apiKey, err := s.apiKeyRepo.GetByID(ctx, keyID)
+	if err != nil {
+		if errors.Is(err, ErrAPIKeyNotFound) {
+			if reader, ok := s.apiKeyRepo.(apiKeyDeleteEvidenceReader); ok {
+				hasEvidence, evidenceErr := reader.HasDeleteEvidence(ctx, keyID)
+				if evidenceErr != nil {
+					return nil, fmt.Errorf("check api key delete evidence: %w", evidenceErr)
+				}
+				if hasEvidence {
+					return nil, ErrAdminAPIKeyDeleted
+				}
+			}
+		}
+		return nil, fmt.Errorf("get api key: %w", err)
+	}
+
+	if apiKey.Status == mappedStatus {
+		return apiKey, nil
+	}
+
+	apiKey.Status = mappedStatus
+	if err := s.apiKeyRepo.Update(ctx, apiKey); err != nil {
+		return nil, fmt.Errorf("update api key: %w", err)
+	}
+
+	s.InvalidateAuthCacheByKey(ctx, apiKey.Key)
+	s.compileAPIKeyIPRules(apiKey)
+	return apiKey, nil
+}
+
 // Delete 删除API Key
 func (s *APIKeyService) Delete(ctx context.Context, id int64, userID int64) error {
 	key, ownerID, err := s.apiKeyRepo.GetKeyAndOwnerID(ctx, id)
@@ -660,6 +729,38 @@ func (s *APIKeyService) Delete(ctx context.Context, id int64, userID int64) erro
 	s.lastUsedTouchL1.Delete(id)
 
 	return nil
+}
+
+// AdminDelete deletes an API key and returns the persisted soft-delete timestamp.
+func (s *APIKeyService) AdminDelete(ctx context.Context, keyID int64) (*AdminDeleteAPIKeyResult, error) {
+	cacheKey := ""
+	apiKey, err := s.apiKeyRepo.GetByID(ctx, keyID)
+	if err == nil && apiKey != nil {
+		cacheKey = apiKey.Key
+		if s.cache != nil {
+			_ = s.cache.DeleteCreateAttemptCount(ctx, apiKey.UserID)
+		}
+	} else if err != nil && !errors.Is(err, ErrAPIKeyNotFound) {
+		return nil, fmt.Errorf("get api key: %w", err)
+	}
+
+	if err := s.apiKeyRepo.Delete(ctx, keyID); err != nil {
+		return nil, fmt.Errorf("delete api key: %w", err)
+	}
+	if cacheKey != "" {
+		s.InvalidateAuthCacheByKey(ctx, cacheKey)
+	}
+	s.lastUsedTouchL1.Delete(keyID)
+
+	reader, ok := s.apiKeyRepo.(apiKeyDeleteTombstoneReader)
+	if !ok {
+		return nil, fmt.Errorf("delete api key: deleted tombstone timestamp unavailable")
+	}
+	deletedAt, err := reader.GetDeletedAt(ctx, keyID)
+	if err != nil {
+		return nil, fmt.Errorf("get deleted api key timestamp: %w", err)
+	}
+	return &AdminDeleteAPIKeyResult{DeletedAt: deletedAt.UTC()}, nil
 }
 
 // ValidateKey 验证API Key是否有效（用于认证中间件）

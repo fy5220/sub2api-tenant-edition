@@ -27,6 +27,9 @@ type apiKeyRepoStub struct {
 	apiKey         *APIKey // GetKeyAndOwnerID 的返回值
 	getByIDErr     error   // GetKeyAndOwnerID 的错误返回值
 	deleteErr      error   // Delete 的错误返回值
+	deleteFn       func(ctx context.Context, id int64) error
+	deletedAt      time.Time
+	deletedAtErr   error
 	deletedIDs     []int64 // 记录已删除的 API Key ID 列表
 	updateLastUsed func(ctx context.Context, id int64, usedAt time.Time) error
 	touchedIDs     []int64
@@ -76,6 +79,9 @@ func (s *apiKeyRepoStub) Update(ctx context.Context, key *APIKey) error {
 // 通过 deletedIDs 可以验证删除操作是否被正确调用。
 func (s *apiKeyRepoStub) Delete(ctx context.Context, id int64) error {
 	s.deletedIDs = append(s.deletedIDs, id)
+	if s.deleteFn != nil {
+		return s.deleteFn(ctx, id)
+	}
 	return s.deleteErr
 }
 
@@ -147,6 +153,16 @@ func (s *apiKeyRepoStub) ResetRateLimitWindows(ctx context.Context, id int64) er
 
 func (s *apiKeyRepoStub) GetRateLimitData(ctx context.Context, id int64) (*APIKeyRateLimitData, error) {
 	panic("unexpected GetRateLimitData call")
+}
+
+func (s *apiKeyRepoStub) GetDeletedAt(context.Context, int64) (time.Time, error) {
+	if s.deletedAtErr != nil {
+		return time.Time{}, s.deletedAtErr
+	}
+	if s.deletedAt.IsZero() {
+		panic("unexpected GetDeletedAt call")
+	}
+	return s.deletedAt, nil
 }
 
 // apiKeyCacheStub 是 APIKeyCache 接口的测试桩实现。
@@ -291,4 +307,71 @@ func TestApiKeyService_Delete_DeleteFails(t *testing.T) {
 	require.Equal(t, []int64{3}, repo.deletedIDs)   // 验证删除操作被调用
 	require.Equal(t, []int64{3}, cache.invalidated) // 验证缓存已被清除（即使删除失败）
 	require.Equal(t, []string{svc.authCacheKey("k")}, cache.deleteAuthKeys)
+}
+
+func TestAPIKeyService_AdminDelete_Success(t *testing.T) {
+	deletedAt := mustParseServiceTime(t, "2026-05-05T10:02:00Z")
+	repo := &apiKeyRepoStub{
+		apiKey:    &APIKey{ID: 42, UserID: 7, Key: "sk-admin-delete"},
+		deletedAt: deletedAt,
+	}
+	cache := &apiKeyCacheStub{}
+	svc := &APIKeyService{apiKeyRepo: repo, cache: cache}
+	svc.lastUsedTouchL1.Store(int64(42), time.Now())
+
+	result, err := svc.AdminDelete(context.Background(), 42)
+	require.NoError(t, err)
+	require.Equal(t, deletedAt, result.DeletedAt)
+	require.Equal(t, []int64{42}, repo.deletedIDs)
+	require.Equal(t, []int64{7}, cache.invalidated)
+	require.Equal(t, []string{svc.authCacheKey("sk-admin-delete")}, cache.deleteAuthKeys)
+	_, exists := svc.lastUsedTouchL1.Load(int64(42))
+	require.False(t, exists, "admin delete should clear touch debounce cache")
+}
+
+func TestAPIKeyService_AdminDelete_RepeatDeleteWithSoftDeleteEvidenceSucceeds(t *testing.T) {
+	deletedAt := mustParseServiceTime(t, "2026-05-05T10:03:00Z")
+	repo := &apiKeyRepoStub{
+		getByIDErr: ErrAPIKeyNotFound,
+		deleteFn: func(ctx context.Context, id int64) error {
+			return nil
+		},
+		deletedAt: deletedAt,
+	}
+	cache := &apiKeyCacheStub{}
+	svc := &APIKeyService{apiKeyRepo: repo, cache: cache}
+	svc.lastUsedTouchL1.Store(int64(55), time.Now())
+
+	result, err := svc.AdminDelete(context.Background(), 55)
+	require.NoError(t, err)
+	require.Equal(t, deletedAt, result.DeletedAt)
+	require.Equal(t, []int64{55}, repo.deletedIDs)
+	require.Empty(t, cache.invalidated)
+	require.Empty(t, cache.deleteAuthKeys)
+	_, exists := svc.lastUsedTouchL1.Load(int64(55))
+	require.False(t, exists, "repeat admin delete should clear touch debounce cache")
+}
+
+func TestAPIKeyService_AdminDelete_UnknownDeleteRemainsNotFound(t *testing.T) {
+	repo := &apiKeyRepoStub{
+		getByIDErr: ErrAPIKeyNotFound,
+		deleteFn: func(ctx context.Context, id int64) error {
+			return ErrAPIKeyNotFound
+		},
+	}
+	cache := &apiKeyCacheStub{}
+	svc := &APIKeyService{apiKeyRepo: repo, cache: cache}
+
+	_, err := svc.AdminDelete(context.Background(), 88)
+	require.ErrorIs(t, err, ErrAPIKeyNotFound)
+	require.Equal(t, []int64{88}, repo.deletedIDs)
+	require.Empty(t, cache.invalidated)
+	require.Empty(t, cache.deleteAuthKeys)
+}
+
+func mustParseServiceTime(t *testing.T, value string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, value)
+	require.NoError(t, err)
+	return parsed
 }

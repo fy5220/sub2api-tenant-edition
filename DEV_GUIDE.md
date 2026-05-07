@@ -245,6 +245,11 @@ git add ent/       # 生成的文件也要提交
 
 ## 五、常用命令速查
 
+### TokenHub tenant fork
+
+- 维护说明：`docs/TENANT_FORK_MAINTENANCE.md`
+- smoke：`make tenant-smoke`
+
 ### 数据库操作
 
 ```bash

@@ -144,6 +144,10 @@ Nginx drops headers containing underscores by default (e.g. `session_id`), which
 
 ## Deployment
 
+### TokenHub Tenant Fork
+
+TokenHub tenant-specific admin API key lifecycle maintenance is documented in [docs/TENANT_FORK_MAINTENANCE.md](docs/TENANT_FORK_MAINTENANCE.md).
+
 ### Method 1: Script Installation (Recommended)
 
 One-click installation script that downloads pre-built binaries from GitHub Releases.
