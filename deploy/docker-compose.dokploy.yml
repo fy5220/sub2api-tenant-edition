@@ -20,6 +20,7 @@ services:
       - "8080"
     volumes:
       - sub2api_data:/app/data
+      - ./config.dokploy.yaml:/app/data/config.yaml:ro
     environment:
       - AUTO_SETUP=true
 
